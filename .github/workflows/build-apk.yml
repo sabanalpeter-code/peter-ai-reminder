@@ -1,0 +1,259 @@
+name: Build Peter AI Reminder APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android platform
+        run: |
+          yes | sdkmanager --licenses
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.10.2
+
+      - name: Generate Android project
+        run: |
+          mkdir -p app/src/main/java/com/peteraireminder
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = 'Peter AI Reminder'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.peteraireminder'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.peteraireminder'
+                  minSdk 23
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:windowLightStatusBar">true</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+
+              <application
+                  android:theme="@style/AppTheme"
+                  android:label="Peter AI Reminder"
+                  android:allowBackup="false"
+                  android:supportsRtl="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/peteraireminder/MainActivity.java <<'EOF'
+          package com.peteraireminder;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.provider.AlarmClock;
+          import android.content.Intent;
+          import android.content.Context;
+          import android.content.ClipboardManager;
+          import android.content.ClipData;
+          import android.net.Uri;
+          import android.graphics.Typeface;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          public class MainActivity extends Activity {
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  ScrollView scroll = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(45, 55, 45, 45);
+                  scroll.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("Peter AI Reminder");
+                  title.setTextSize(28);
+                  title.setTypeface(null, Typeface.BOLD);
+                  title.setGravity(Gravity.CENTER);
+                  root.addView(title);
+
+                  TextView info = new TextView(this);
+                  info.setText(
+                      "\nYour work assistant app.\n\n" +
+                      "Current week:\n" +
+                      "Work: 4:00 AM to 12:00 NN\n" +
+                      "Wake reminder: 2:40 AM\n\n" +
+                      "This Sunday:\n" +
+                      "Work: 11:30 AM to 7:30 PM\n" +
+                      "Wake reminder: 10:00 AM\n\n" +
+                      "This starter app uses your phone Clock app for real alarms, then helps you open Messenger AI for preparation mode."
+                  );
+                  info.setTextSize(17);
+                  root.addView(info);
+
+                  Button alarmEarly = new Button(this);
+                  alarmEarly.setText("Set 2:40 AM Work Alarm");
+                  alarmEarly.setOnClickListener(v -> setAlarm(
+                      2,
+                      40,
+                      "Peter, wake up. Work is 4:00 AM to 12:00 NN. Open Messenger AI and type: Prepare me."
+                  ));
+                  root.addView(alarmEarly);
+
+                  Button alarmSunday = new Button(this);
+                  alarmSunday.setText("Set Sunday 10:00 AM Alarm");
+                  alarmSunday.setOnClickListener(v -> setAlarm(
+                      10,
+                      0,
+                      "Peter, prepare now. Work is 11:30 AM to 7:30 PM. Open Messenger AI and type: Prepare me."
+                  ));
+                  root.addView(alarmSunday);
+
+                  Button copyCommand = new Button(this);
+                  copyCommand.setText("Copy Messenger AI Command");
+                  copyCommand.setOnClickListener(v -> copyText(
+                      "Call mode. Prepare me for work."
+                  ));
+                  root.addView(copyCommand);
+
+                  Button openMessenger = new Button(this);
+                  openMessenger.setText("Open Messenger");
+                  openMessenger.setOnClickListener(v -> openMessenger());
+                  root.addView(openMessenger);
+
+                  TextView note = new TextView(this);
+                  note.setText(
+                      "\nHow to use:\n" +
+                      "1. Set your alarm.\n" +
+                      "2. When it rings, open this app.\n" +
+                      "3. Copy the Messenger AI command.\n" +
+                      "4. Open Messenger and send it to your AI.\n\n" +
+                      "Next upgrade: editable weekly schedule, automatic Sunday reset, louder alarm screen, and AI API connection."
+                  );
+                  note.setTextSize(16);
+                  root.addView(note);
+
+                  setContentView(scroll);
+              }
+
+              private void setAlarm(int hour, int minute, String message) {
+                  Intent intent = new Intent(AlarmClock.ACTION_SET_ALARM);
+                  intent.putExtra(AlarmClock.EXTRA_HOUR, hour);
+                  intent.putExtra(AlarmClock.EXTRA_MINUTES, minute);
+                  intent.putExtra(AlarmClock.EXTRA_MESSAGE, message);
+                  intent.putExtra(AlarmClock.EXTRA_SKIP_UI, false);
+
+                  try {
+                      startActivity(intent);
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Open your Clock app and set the alarm manually.", Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              private void copyText(String text) {
+                  ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                  ClipData clip = ClipData.newPlainText("Messenger AI Command", text);
+                  clipboard.setPrimaryClip(clip);
+                  Toast.makeText(this, "Command copied.", Toast.LENGTH_SHORT).show();
+              }
+
+              private void openMessenger() {
+                  try {
+                      Intent launchIntent = getPackageManager().getLaunchIntentForPackage("com.facebook.orca");
+                      if (launchIntent != null) {
+                          startActivity(launchIntent);
+                      } else {
+                          startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://m.me/")));
+                      }
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Open Messenger manually.", Toast.LENGTH_LONG).show();
+                  }
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Peter-AI-Reminder-APK
+          path: app/build/outputs/apk/debug/*.apk
