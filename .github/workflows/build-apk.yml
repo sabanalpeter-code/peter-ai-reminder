@@ -1,4 +1,4 @@
-name: Build Peter AI Reminder APK
+name: Build Peter AI Reminder v2 APK
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
         with:
           gradle-version: 8.10.2
 
-      - name: Generate Android project
+      - name: Generate Peter AI Reminder v2 project
         run: |
           mkdir -p app/src/main/java/com/peteraireminder
           mkdir -p app/src/main/res/values
@@ -54,7 +54,7 @@ jobs:
               }
           }
 
-          rootProject.name = 'Peter AI Reminder'
+          rootProject.name = 'Peter AI Reminder v2'
           include ':app'
           EOF
 
@@ -74,11 +74,11 @@ jobs:
               compileSdk 35
 
               defaultConfig {
-                  applicationId 'com.peteraireminder'
+                  applicationId 'com.peteraireminder.v2'
                   minSdk 23
                   targetSdk 35
-                  versionCode 1
-                  versionName '1.0'
+                  versionCode 2
+                  versionName '2.0'
               }
           }
           EOF
@@ -95,13 +95,23 @@ jobs:
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-              <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
               <application
                   android:theme="@style/AppTheme"
-                  android:label="Peter AI Reminder"
+                  android:label="Peter AI Reminder v2"
                   android:allowBackup="false"
                   android:supportsRtl="true">
+
+                  <activity
+                      android:name=".AlarmActivity"
+                      android:exported="false"
+                      android:showWhenLocked="true"
+                      android:turnScreenOn="true" />
 
                   <activity
                       android:name=".MainActivity"
@@ -112,43 +122,255 @@ jobs:
                       </intent-filter>
                   </activity>
 
+                  <receiver
+                      android:name=".AlarmReceiver"
+                      android:exported="false" />
+
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+
               </application>
           </manifest>
+          EOF
+
+          cat > app/src/main/java/com/peteraireminder/ScheduleHelper.java <<'EOF'
+          package com.peteraireminder;
+
+          import android.app.AlarmManager;
+          import android.app.PendingIntent;
+          import android.content.Context;
+          import android.content.Intent;
+          import java.util.Calendar;
+
+          public class ScheduleHelper {
+              public static final String PREFS = "peter_prefs";
+              public static final String KEY_SCHEDULE = "weekly_schedule";
+
+              public static final String DEFAULT_SCHEDULE =
+                      "MON OFF\n" +
+                      "TUE 04:00-12:00 02:40\n" +
+                      "WED 04:00-12:00 02:40\n" +
+                      "THU 04:00-12:00 02:40\n" +
+                      "FRI 04:00-12:00 02:40\n" +
+                      "SAT 04:00-12:00 02:40\n" +
+                      "SUN 11:30-19:30 10:00";
+
+              public static String getSchedule(Context context) {
+                  return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                          .getString(KEY_SCHEDULE, DEFAULT_SCHEDULE);
+              }
+
+              public static void saveSchedule(Context context, String schedule) {
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                          .edit()
+                          .putString(KEY_SCHEDULE, schedule)
+                          .apply();
+              }
+
+              public static int scheduleAll(Context context) {
+                  cancelAll(context);
+
+                  String[] lines = getSchedule(context).split("\\n");
+                  int count = 0;
+
+                  for (String raw : lines) {
+                      String line = raw.trim().toUpperCase();
+                      if (line.length() == 0) continue;
+
+                      String[] parts = line.split("\\s+");
+                      if (parts.length < 2) continue;
+
+                      String dayName = parts[0];
+                      int day = dayToCalendar(dayName);
+
+                      if (day == -1) continue;
+
+                      if (day == Calendar.MONDAY) {
+                          continue;
+                      }
+
+                      if (parts[1].equals("OFF")) {
+                          continue;
+                      }
+
+                      if (parts.length < 3) continue;
+
+                      String shift = parts[1];
+                      int[] reminder = parseTime(parts[2]);
+                      if (reminder == null) continue;
+
+                      String message =
+                              "Peter, wake up. Today is " + dayName + ". Your work shift is " +
+                              shift + ". Prepare your uniform, phone, charger, water, fare, and food. " +
+                              "Move early and protect your energy.";
+
+                      scheduleWorkAlarm(context, day, reminder[0], reminder[1], dayName, shift, message);
+                      count++;
+                  }
+
+                  scheduleSundayReset(context);
+                  count++;
+
+                  return count;
+              }
+
+              public static void scheduleWorkAlarm(Context context, int day, int hour, int minute, String dayName, String shift, String message) {
+                  long when = nextTimeMillis(day, hour, minute);
+                  int requestCode = 1000 + day;
+                  scheduleAlarm(context, when, requestCode, "WORK", day, hour, minute, dayName, shift, message);
+              }
+
+              public static void scheduleSundayReset(Context context) {
+                  String message =
+                          "Peter, today is schedule reset day. Send your new Monday to Sunday work schedule and reminder times.";
+                  long when = nextTimeMillis(Calendar.SUNDAY, 20, 0);
+                  scheduleAlarm(context, when, 9000, "RESET", Calendar.SUNDAY, 20, 0, "SUN", "RESET", message);
+              }
+
+              public static void scheduleAgainNextWeek(Context context, String type, int day, int hour, int minute, String dayName, String shift, String message) {
+                  int requestCode = type.equals("RESET") ? 9000 : 1000 + day;
+                  long when = nextTimeMillis(day, hour, minute);
+                  scheduleAlarm(context, when, requestCode, type, day, hour, minute, dayName, shift, message);
+              }
+
+              private static void scheduleAlarm(Context context, long when, int requestCode, String type, int day, int hour, int minute, String dayName, String shift, String message) {
+                  AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+
+                  Intent intent = new Intent(context, AlarmReceiver.class);
+                  intent.putExtra("type", type);
+                  intent.putExtra("day", day);
+                  intent.putExtra("hour", hour);
+                  intent.putExtra("minute", minute);
+                  intent.putExtra("dayName", dayName);
+                  intent.putExtra("shift", shift);
+                  intent.putExtra("message", message);
+
+                  PendingIntent pi = PendingIntent.getBroadcast(
+                          context,
+                          requestCode,
+                          intent,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                  );
+
+                  Intent showIntent = new Intent(context, MainActivity.class);
+                  PendingIntent showPi = PendingIntent.getActivity(
+                          context,
+                          requestCode + 50000,
+                          showIntent,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                  );
+
+                  if (alarmManager != null) {
+                      alarmManager.setAlarmClock(new AlarmManager.AlarmClockInfo(when, showPi), pi);
+                  }
+              }
+
+              public static void cancelAll(Context context) {
+                  for (int d = Calendar.SUNDAY; d <= Calendar.SATURDAY; d++) {
+                      cancelCode(context, 1000 + d);
+                  }
+                  cancelCode(context, 9000);
+              }
+
+              private static void cancelCode(Context context, int requestCode) {
+                  AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+                  Intent intent = new Intent(context, AlarmReceiver.class);
+                  PendingIntent pi = PendingIntent.getBroadcast(
+                          context,
+                          requestCode,
+                          intent,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                  );
+                  if (alarmManager != null) alarmManager.cancel(pi);
+              }
+
+              private static long nextTimeMillis(int day, int hour, int minute) {
+                  Calendar now = Calendar.getInstance();
+                  Calendar target = Calendar.getInstance();
+
+                  target.set(Calendar.DAY_OF_WEEK, day);
+                  target.set(Calendar.HOUR_OF_DAY, hour);
+                  target.set(Calendar.MINUTE, minute);
+                  target.set(Calendar.SECOND, 0);
+                  target.set(Calendar.MILLISECOND, 0);
+
+                  if (target.getTimeInMillis() <= now.getTimeInMillis()) {
+                      target.add(Calendar.WEEK_OF_YEAR, 1);
+                  }
+
+                  return target.getTimeInMillis();
+              }
+
+              private static int dayToCalendar(String day) {
+                  if (day.equals("SUN")) return Calendar.SUNDAY;
+                  if (day.equals("MON")) return Calendar.MONDAY;
+                  if (day.equals("TUE")) return Calendar.TUESDAY;
+                  if (day.equals("WED")) return Calendar.WEDNESDAY;
+                  if (day.equals("THU")) return Calendar.THURSDAY;
+                  if (day.equals("FRI")) return Calendar.FRIDAY;
+                  if (day.equals("SAT")) return Calendar.SATURDAY;
+                  return -1;
+              }
+
+              private static int[] parseTime(String text) {
+                  try {
+                      String[] p = text.split(":");
+                      int h = Integer.parseInt(p[0]);
+                      int m = Integer.parseInt(p[1]);
+                      if (h < 0 || h > 23 || m < 0 || m > 59) return null;
+                      return new int[]{h, m};
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+          }
           EOF
 
           cat > app/src/main/java/com/peteraireminder/MainActivity.java <<'EOF'
           package com.peteraireminder;
 
+          import android.Manifest;
           import android.app.Activity;
           import android.os.Bundle;
-          import android.provider.AlarmClock;
-          import android.content.Intent;
+          import android.os.Build;
           import android.content.Context;
+          import android.content.Intent;
           import android.content.ClipboardManager;
           import android.content.ClipData;
-          import android.net.Uri;
+          import android.content.pm.PackageManager;
           import android.graphics.Typeface;
+          import android.net.Uri;
           import android.view.Gravity;
+          import android.view.View;
           import android.widget.Button;
+          import android.widget.EditText;
           import android.widget.LinearLayout;
           import android.widget.ScrollView;
           import android.widget.TextView;
           import android.widget.Toast;
 
           public class MainActivity extends Activity {
+              private EditText scheduleBox;
+              private TextView statusText;
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
+                  requestNotificationPermission();
 
                   ScrollView scroll = new ScrollView(this);
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
-                  root.setPadding(45, 55, 45, 45);
+                  root.setPadding(38, 45, 38, 45);
                   scroll.addView(root);
 
                   TextView title = new TextView(this);
-                  title.setText("Peter AI Reminder");
+                  title.setText("Peter AI Reminder v2");
                   title.setTextSize(28);
                   title.setTypeface(null, Typeface.BOLD);
                   title.setGravity(Gravity.CENTER);
@@ -156,74 +378,106 @@ jobs:
 
                   TextView info = new TextView(this);
                   info.setText(
-                      "\nYour work assistant app.\n\n" +
-                      "Current week:\n" +
-                      "Work: 4:00 AM to 12:00 NN\n" +
-                      "Wake reminder: 2:40 AM\n\n" +
-                      "This Sunday:\n" +
-                      "Work: 11:30 AM to 7:30 PM\n" +
-                      "Wake reminder: 10:00 AM\n\n" +
-                      "This starter app uses your phone Clock app for real alarms, then helps you open Messenger AI for preparation mode."
+                          "\nAutomatic local reminder assistant.\n\n" +
+                          "Fixed rule:\n" +
+                          "Monday = Day off. No work alarm.\n\n" +
+                          "Sunday 8:00 PM = schedule reset reminder.\n\n" +
+                          "Edit your weekly schedule below using 24-hour time.\n\n" +
+                          "Format:\n" +
+                          "DAY SHIFT REMINDER\n\n" +
+                          "Example:\n" +
+                          "TUE 04:00-12:00 02:40\n" +
+                          "SUN 11:30-19:30 10:00\n"
                   );
-                  info.setTextSize(17);
+                  info.setTextSize(16);
                   root.addView(info);
 
-                  Button alarmEarly = new Button(this);
-                  alarmEarly.setText("Set 2:40 AM Work Alarm");
-                  alarmEarly.setOnClickListener(v -> setAlarm(
-                      2,
-                      40,
-                      "Peter, wake up. Work is 4:00 AM to 12:00 NN. Open Messenger AI and type: Prepare me."
-                  ));
-                  root.addView(alarmEarly);
+                  scheduleBox = new EditText(this);
+                  scheduleBox.setText(ScheduleHelper.getSchedule(this));
+                  scheduleBox.setTextSize(16);
+                  scheduleBox.setMinLines(8);
+                  scheduleBox.setGravity(Gravity.TOP);
+                  root.addView(scheduleBox);
 
-                  Button alarmSunday = new Button(this);
-                  alarmSunday.setText("Set Sunday 10:00 AM Alarm");
-                  alarmSunday.setOnClickListener(v -> setAlarm(
-                      10,
-                      0,
-                      "Peter, prepare now. Work is 11:30 AM to 7:30 PM. Open Messenger AI and type: Prepare me."
-                  ));
-                  root.addView(alarmSunday);
+                  Button saveButton = new Button(this);
+                  saveButton.setText("Save Schedule and Activate Automatic Alarms");
+                  saveButton.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          String text = scheduleBox.getText().toString().trim();
+                          ScheduleHelper.saveSchedule(MainActivity.this, text);
+                          int count = ScheduleHelper.scheduleAll(MainActivity.this);
+                          statusText.setText("Activated. Scheduled " + count + " automatic reminders. Monday is protected as day off.");
+                          Toast.makeText(MainActivity.this, "Automatic reminders activated.", Toast.LENGTH_LONG).show();
+                      }
+                  });
+                  root.addView(saveButton);
+
+                  Button resetDefault = new Button(this);
+                  resetDefault.setText("Restore Default Schedule");
+                  resetDefault.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          scheduleBox.setText(ScheduleHelper.DEFAULT_SCHEDULE);
+                          ScheduleHelper.saveSchedule(MainActivity.this, ScheduleHelper.DEFAULT_SCHEDULE);
+                          Toast.makeText(MainActivity.this, "Default schedule restored.", Toast.LENGTH_SHORT).show();
+                      }
+                  });
+                  root.addView(resetDefault);
+
+                  Button cancelButton = new Button(this);
+                  cancelButton.setText("Cancel All App Alarms");
+                  cancelButton.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          ScheduleHelper.cancelAll(MainActivity.this);
+                          statusText.setText("All Peter AI Reminder alarms cancelled.");
+                          Toast.makeText(MainActivity.this, "Alarms cancelled.", Toast.LENGTH_SHORT).show();
+                      }
+                  });
+                  root.addView(cancelButton);
 
                   Button copyCommand = new Button(this);
                   copyCommand.setText("Copy Messenger AI Command");
-                  copyCommand.setOnClickListener(v -> copyText(
-                      "Call mode. Prepare me for work."
-                  ));
+                  copyCommand.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          copyText("Call mode. Prepare me for work.");
+                      }
+                  });
                   root.addView(copyCommand);
 
                   Button openMessenger = new Button(this);
                   openMessenger.setText("Open Messenger");
-                  openMessenger.setOnClickListener(v -> openMessenger());
+                  openMessenger.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          openMessenger();
+                      }
+                  });
                   root.addView(openMessenger);
 
-                  TextView note = new TextView(this);
-                  note.setText(
-                      "\nHow to use:\n" +
-                      "1. Set your alarm.\n" +
-                      "2. When it rings, open this app.\n" +
-                      "3. Copy the Messenger AI command.\n" +
-                      "4. Open Messenger and send it to your AI.\n\n" +
-                      "Next upgrade: editable weekly schedule, automatic Sunday reset, louder alarm screen, and AI API connection."
+                  statusText = new TextView(this);
+                  statusText.setText(
+                          "\nStatus: Ready.\n\n" +
+                          "After installing v2:\n" +
+                          "1. Allow notifications.\n" +
+                          "2. Save and activate automatic alarms.\n" +
+                          "3. Keep Monday as OFF.\n" +
+                          "4. Every Sunday, update your next weekly schedule.\n\n" +
+                          "Local AI style: the app uses smart rules without internet or API cost."
                   );
-                  note.setTextSize(16);
-                  root.addView(note);
+                  statusText.setTextSize(16);
+                  root.addView(statusText);
 
                   setContentView(scroll);
               }
 
-              private void setAlarm(int hour, int minute, String message) {
-                  Intent intent = new Intent(AlarmClock.ACTION_SET_ALARM);
-                  intent.putExtra(AlarmClock.EXTRA_HOUR, hour);
-                  intent.putExtra(AlarmClock.EXTRA_MINUTES, minute);
-                  intent.putExtra(AlarmClock.EXTRA_MESSAGE, message);
-                  intent.putExtra(AlarmClock.EXTRA_SKIP_UI, false);
-
-                  try {
-                      startActivity(intent);
-                  } catch (Exception e) {
-                      Toast.makeText(this, "Open your Clock app and set the alarm manually.", Toast.LENGTH_LONG).show();
+              private void requestNotificationPermission() {
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 100);
+                      }
                   }
               }
 
@@ -249,11 +503,335 @@ jobs:
           }
           EOF
 
+          cat > app/src/main/java/com/peteraireminder/AlarmReceiver.java <<'EOF'
+          package com.peteraireminder;
+
+          import android.app.Notification;
+          import android.app.NotificationChannel;
+          import android.app.NotificationManager;
+          import android.app.PendingIntent;
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.media.AudioAttributes;
+          import android.media.RingtoneManager;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.VibrationEffect;
+          import android.os.Vibrator;
+
+          public class AlarmReceiver extends BroadcastReceiver {
+              private static final String CHANNEL_ID = "peter_alarm_channel";
+
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  String type = intent.getStringExtra("type");
+                  int day = intent.getIntExtra("day", 1);
+                  int hour = intent.getIntExtra("hour", 8);
+                  int minute = intent.getIntExtra("minute", 0);
+                  String dayName = intent.getStringExtra("dayName");
+                  String shift = intent.getStringExtra("shift");
+                  String message = intent.getStringExtra("message");
+
+                  if (type == null) type = "WORK";
+                  if (dayName == null) dayName = "";
+                  if (shift == null) shift = "";
+                  if (message == null) message = "Peter, this is your reminder.";
+
+                  vibrate(context);
+                  showNotification(context, message);
+                  openAlarmScreen(context, message);
+
+                  ScheduleHelper.scheduleAgainNextWeek(context, type, day, hour, minute, dayName, shift, message);
+              }
+
+              private void openAlarmScreen(Context context, String message) {
+                  try {
+                      Intent i = new Intent(context, AlarmActivity.class);
+                      i.putExtra("message", message);
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
+                      context.startActivity(i);
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              private void showNotification(Context context, String message) {
+                  NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
+                  if (nm == null) return;
+
+                  Uri sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
+
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      AudioAttributes attrs = new AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_ALARM)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                              .build();
+
+                      NotificationChannel channel = new NotificationChannel(
+                              CHANNEL_ID,
+                              "Peter AI Reminders",
+                              NotificationManager.IMPORTANCE_HIGH
+                      );
+                      channel.setDescription("Work schedule alarms and reminders");
+                      channel.enableVibration(true);
+                      channel.setSound(sound, attrs);
+                      nm.createNotificationChannel(channel);
+                  }
+
+                  Intent open = new Intent(context, AlarmActivity.class);
+                  open.putExtra("message", message);
+                  PendingIntent openPi = PendingIntent.getActivity(
+                          context,
+                          777,
+                          open,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
+                  );
+
+                  Notification.Builder builder;
+                  if (Build.VERSION.SDK_INT >= 26) {
+                      builder = new Notification.Builder(context, CHANNEL_ID);
+                  } else {
+                      builder = new Notification.Builder(context);
+                  }
+
+                  builder.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                          .setContentTitle("Peter AI Reminder")
+                          .setContentText(message)
+                          .setStyle(new Notification.BigTextStyle().bigText(message))
+                          .setCategory(Notification.CATEGORY_ALARM)
+                          .setPriority(Notification.PRIORITY_MAX)
+                          .setAutoCancel(true)
+                          .setContentIntent(openPi)
+                          .setFullScreenIntent(openPi, true)
+                          .setSound(sound)
+                          .setVibrate(new long[]{0, 700, 400, 700, 400, 1000});
+
+                  nm.notify(1001, builder.build());
+              }
+
+              private void vibrate(Context context) {
+                  try {
+                      Vibrator vibrator = (Vibrator) context.getSystemService(Context.VIBRATOR_SERVICE);
+                      if (vibrator == null) return;
+
+                      long[] pattern = new long[]{0, 700, 400, 700, 400, 1000};
+
+                      if (Build.VERSION.SDK_INT >= 26) {
+                          vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1));
+                      } else {
+                          vibrator.vibrate(pattern, -1);
+                      }
+                  } catch (Exception ignored) {
+                  }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/peteraireminder/AlarmActivity.java <<'EOF'
+          package com.peteraireminder;
+
+          import android.app.Activity;
+          import android.os.Bundle;
+          import android.os.Build;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.ClipboardManager;
+          import android.content.ClipData;
+          import android.graphics.Typeface;
+          import android.media.MediaPlayer;
+          import android.media.RingtoneManager;
+          import android.net.Uri;
+          import android.speech.tts.TextToSpeech;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.view.WindowManager;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.util.Locale;
+
+          public class AlarmActivity extends Activity {
+              private MediaPlayer player;
+              private TextToSpeech tts;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  getWindow().addFlags(
+                          WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON |
+                          WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED |
+                          WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON
+                  );
+
+                  if (Build.VERSION.SDK_INT >= 27) {
+                      setShowWhenLocked(true);
+                      setTurnScreenOn(true);
+                  }
+
+                  String message = getIntent().getStringExtra("message");
+                  if (message == null) message = "Peter, this is your reminder.";
+
+                  startAlarmSound();
+                  speak(message);
+
+                  ScrollView scroll = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(45, 55, 45, 45);
+                  scroll.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("Peter, Wake Up");
+                  title.setTextSize(30);
+                  title.setTypeface(null, Typeface.BOLD);
+                  title.setGravity(Gravity.CENTER);
+                  root.addView(title);
+
+                  TextView body = new TextView(this);
+                  body.setText("\n" + message + "\n\nChecklist:\n- Uniform\n- Phone and charger\n- Water\n- Fare\n- Food or light snack\n- Leave early\n\nAfter work: eat, rest, and recover.");
+                  body.setTextSize(20);
+                  root.addView(body);
+
+                  Button stop = new Button(this);
+                  stop.setText("Stop Alarm");
+                  stop.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          stopEverything();
+                          finish();
+                      }
+                  });
+                  root.addView(stop);
+
+                  Button copy = new Button(this);
+                  copy.setText("Copy Messenger AI Command");
+                  copy.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          copyText("Call mode. Prepare me for work.");
+                      }
+                  });
+                  root.addView(copy);
+
+                  Button messenger = new Button(this);
+                  messenger.setText("Open Messenger");
+                  messenger.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          openMessenger();
+                      }
+                  });
+                  root.addView(messenger);
+
+                  setContentView(scroll);
+              }
+
+              private void startAlarmSound() {
+                  try {
+                      Uri alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM);
+                      if (alarmUri == null) alarmUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION);
+
+                      player = MediaPlayer.create(this, alarmUri);
+                      if (player != null) {
+                          player.setLooping(true);
+                          player.start();
+                      }
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              private void speak(final String message) {
+                  try {
+                      tts = new TextToSpeech(this, new TextToSpeech.OnInitListener() {
+                          @Override
+                          public void onInit(int status) {
+                              if (status == TextToSpeech.SUCCESS) {
+                                  tts.setLanguage(Locale.US);
+                                  if (Build.VERSION.SDK_INT >= 21) {
+                                      tts.speak(message, TextToSpeech.QUEUE_FLUSH, null, "peter_alarm");
+                                  } else {
+                                      tts.speak(message, TextToSpeech.QUEUE_FLUSH, null);
+                                  }
+                              }
+                          }
+                      });
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              private void stopEverything() {
+                  try {
+                      if (player != null) {
+                          player.stop();
+                          player.release();
+                          player = null;
+                      }
+                  } catch (Exception ignored) {
+                  }
+
+                  try {
+                      if (tts != null) {
+                          tts.stop();
+                          tts.shutdown();
+                          tts = null;
+                      }
+                  } catch (Exception ignored) {
+                  }
+              }
+
+              private void copyText(String text) {
+                  ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                  ClipData clip = ClipData.newPlainText("Messenger AI Command", text);
+                  clipboard.setPrimaryClip(clip);
+                  Toast.makeText(this, "Command copied.", Toast.LENGTH_SHORT).show();
+              }
+
+              private void openMessenger() {
+                  try {
+                      Intent launchIntent = getPackageManager().getLaunchIntentForPackage("com.facebook.orca");
+                      if (launchIntent != null) {
+                          startActivity(launchIntent);
+                      } else {
+                          startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://m.me/")));
+                      }
+                  } catch (Exception e) {
+                      Toast.makeText(this, "Open Messenger manually.", Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  stopEverything();
+                  super.onDestroy();
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/peteraireminder/BootReceiver.java <<'EOF'
+          package com.peteraireminder;
+
+          import android.content.BroadcastReceiver;
+          import android.content.Context;
+          import android.content.Intent;
+
+          public class BootReceiver extends BroadcastReceiver {
+              @Override
+              public void onReceive(Context context, Intent intent) {
+                  if (intent != null && Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) {
+                      ScheduleHelper.scheduleAll(context);
+                  }
+              }
+          }
+          EOF
+
       - name: Build APK
         run: gradle assembleDebug
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Peter-AI-Reminder-APK
+          name: Peter-AI-Reminder-v2-APK
           path: app/build/outputs/apk/debug/*.apk
