@@ -1,4 +1,4 @@
-name: Build Peter AI Reminder v2 APK
+name: Build Peter AI Reminder v3 APK
 
 on:
   workflow_dispatch:
@@ -32,7 +32,7 @@ jobs:
         with:
           gradle-version: 8.10.2
 
-      - name: Generate Peter AI Reminder v2 project
+      - name: Generate Peter AI Reminder v3 project
         run: |
           mkdir -p app/src/main/java/com/peteraireminder
           mkdir -p app/src/main/res/values
@@ -54,7 +54,7 @@ jobs:
               }
           }
 
-          rootProject.name = 'Peter AI Reminder v2'
+          rootProject.name = 'Peter AI Reminder v3'
           include ':app'
           EOF
 
@@ -74,11 +74,11 @@ jobs:
               compileSdk 35
 
               defaultConfig {
-                  applicationId 'com.peteraireminder.v2'
+                  applicationId 'com.peteraireminder.v3'
                   minSdk 23
                   targetSdk 35
-                  versionCode 2
-                  versionName '2.0'
+                  versionCode 3
+                  versionName '3.0'
               }
           }
           EOF
@@ -96,14 +96,19 @@ jobs:
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
               <uses-permission android:name="android.permission.VIBRATE" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
+              <queries>
+                  <package android:name="com.facebook.orca" />
+              </queries>
+
               <application
                   android:theme="@style/AppTheme"
-                  android:label="Peter AI Reminder v2"
+                  android:label="Peter AI Reminder v3"
                   android:allowBackup="false"
                   android:supportsRtl="true">
 
@@ -112,6 +117,10 @@ jobs:
                       android:exported="false"
                       android:showWhenLocked="true"
                       android:turnScreenOn="true" />
+
+                  <activity
+                      android:name=".VoiceAssistantActivity"
+                      android:exported="false" />
 
                   <activity
                       android:name=".MainActivity"
@@ -145,109 +154,253 @@ jobs:
           import android.app.PendingIntent;
           import android.content.Context;
           import android.content.Intent;
+          import java.text.SimpleDateFormat;
           import java.util.Calendar;
+          import java.util.Locale;
 
           public class ScheduleHelper {
-              public static final String PREFS = "peter_prefs";
-              public static final String KEY_SCHEDULE = "weekly_schedule";
+              public static final String PREFS = "peter_prefs_v3";
+              public static final String KEY_BASE_MODE = "base_mode";
+              public static final String KEY_BASE_SUNDAY = "base_sunday";
 
-              public static final String DEFAULT_SCHEDULE =
-                      "MON OFF\n" +
-                      "TUE 04:00-12:00 02:40\n" +
-                      "WED 04:00-12:00 02:40\n" +
-                      "THU 04:00-12:00 02:40\n" +
-                      "FRI 04:00-12:00 02:40\n" +
-                      "SAT 04:00-12:00 02:40\n" +
-                      "SUN 11:30-19:30 10:00";
+              public static final String MODE_A = "A";
+              public static final String MODE_B = "B";
 
-              public static String getSchedule(Context context) {
-                  return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-                          .getString(KEY_SCHEDULE, DEFAULT_SCHEDULE);
+              public static final String WEEK_A_NAME = "4 AM Week";
+              public static final String WEEK_B_NAME = "11:30 AM Week";
+
+              public static final String WEEK_A_SHIFT = "4:00 AM to 12:00 NN";
+              public static final String WEEK_B_SHIFT = "11:30 AM to 7:30 PM";
+
+              public static final int WEEK_A_REMINDER_HOUR = 2;
+              public static final int WEEK_A_REMINDER_MINUTE = 40;
+
+              public static final int WEEK_B_REMINDER_HOUR = 10;
+              public static final int WEEK_B_REMINDER_MINUTE = 0;
+
+              public static void initDefaults(Context context) {
+                  if (!context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).contains(KEY_BASE_MODE)) {
+                      setCurrentWeekMode(context, MODE_A);
+                  }
               }
 
-              public static void saveSchedule(Context context, String schedule) {
+              public static void setCurrentWeekMode(Context context, String mode) {
+                  long baseSunday = mostRecentSundayStartMillis();
                   context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
                           .edit()
-                          .putString(KEY_SCHEDULE, schedule)
+                          .putString(KEY_BASE_MODE, mode)
+                          .putLong(KEY_BASE_SUNDAY, baseSunday)
                           .apply();
+                  scheduleUpcoming(context);
               }
 
-              public static int scheduleAll(Context context) {
-                  cancelAll(context);
+              public static String getBaseMode(Context context) {
+                  initDefaults(context);
+                  return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                          .getString(KEY_BASE_MODE, MODE_A);
+              }
 
-                  String[] lines = getSchedule(context).split("\\n");
-                  int count = 0;
+              public static long getBaseSunday(Context context) {
+                  initDefaults(context);
+                  return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                          .getLong(KEY_BASE_SUNDAY, mostRecentSundayStartMillis());
+              }
 
-                  for (String raw : lines) {
-                      String line = raw.trim().toUpperCase();
-                      if (line.length() == 0) continue;
+              public static String getModeForDate(Context context, Calendar date) {
+                  String baseMode = getBaseMode(context);
+                  long baseSunday = getBaseSunday(context);
+                  long targetSunday = sundayStartMillis(date);
 
-                      String[] parts = line.split("\\s+");
-                      if (parts.length < 2) continue;
+                  long diff = targetSunday - baseSunday;
+                  long weekMs = 7L * 24L * 60L * 60L * 1000L;
+                  long weeks = diff / weekMs;
 
-                      String dayName = parts[0];
-                      int day = dayToCalendar(dayName);
+                  if (weeks < 0) weeks = 0;
 
-                      if (day == -1) continue;
+                  boolean even = weeks % 2 == 0;
+                  if (even) return baseMode;
 
-                      if (day == Calendar.MONDAY) {
-                          continue;
-                      }
+                  return baseMode.equals(MODE_A) ? MODE_B : MODE_A;
+              }
 
-                      if (parts[1].equals("OFF")) {
-                          continue;
-                      }
+              public static boolean isMonday(Calendar date) {
+                  return date.get(Calendar.DAY_OF_WEEK) == Calendar.MONDAY;
+              }
 
-                      if (parts.length < 3) continue;
+              public static String getShiftForMode(String mode) {
+                  return mode.equals(MODE_A) ? WEEK_A_SHIFT : WEEK_B_SHIFT;
+              }
 
-                      String shift = parts[1];
-                      int[] reminder = parseTime(parts[2]);
-                      if (reminder == null) continue;
+              public static String getModeName(String mode) {
+                  return mode.equals(MODE_A) ? WEEK_A_NAME : WEEK_B_NAME;
+              }
 
-                      String message =
-                              "Peter, wake up. Today is " + dayName + ". Your work shift is " +
-                              shift + ". Prepare your uniform, phone, charger, water, fare, and food. " +
-                              "Move early and protect your energy.";
+              public static int getReminderHour(String mode) {
+                  return mode.equals(MODE_A) ? WEEK_A_REMINDER_HOUR : WEEK_B_REMINDER_HOUR;
+              }
 
-                      scheduleWorkAlarm(context, day, reminder[0], reminder[1], dayName, shift, message);
-                      count++;
+              public static int getReminderMinute(String mode) {
+                  return mode.equals(MODE_A) ? WEEK_A_REMINDER_MINUTE : WEEK_B_REMINDER_MINUTE;
+              }
+
+              public static String getReminderText(String mode) {
+                  return mode.equals(MODE_A) ? "2:40 AM" : "10:00 AM";
+              }
+
+              public static String todaySummary(Context context) {
+                  Calendar today = Calendar.getInstance();
+                  String day = dayName(today);
+
+                  if (isMonday(today)) {
+                      return "Peter, today is Monday. Monday is your fixed day off. No work alarm today. Use this day to rest, wash your uniform, check your money, charge your phone, and prepare for the next work day.";
                   }
 
-                  scheduleSundayReset(context);
-                  count++;
+                  String mode = getModeForDate(context, today);
+                  return "Peter, today is " + day + ". Your schedule is " + getShiftForMode(mode) +
+                          ". Your reminder time is " + getReminderText(mode) +
+                          ". Current rotation is " + getModeName(mode) + ".";
+              }
+
+              public static String tomorrowSummary(Context context) {
+                  Calendar tomorrow = Calendar.getInstance();
+                  tomorrow.add(Calendar.DATE, 1);
+                  String day = dayName(tomorrow);
+
+                  if (isMonday(tomorrow)) {
+                      return "Tomorrow is Monday, Peter. Monday is your fixed day off. No work alarm tomorrow.";
+                  }
+
+                  String mode = getModeForDate(context, tomorrow);
+                  return "Tomorrow is " + day + ". Your shift is " + getShiftForMode(mode) +
+                          ". Reminder time is " + getReminderText(mode) + ".";
+              }
+
+              public static String nextShiftSummary(Context context) {
+                  Calendar now = Calendar.getInstance();
+
+                  for (int i = 0; i < 15; i++) {
+                      Calendar day = Calendar.getInstance();
+                      day.add(Calendar.DATE, i);
+
+                      if (isMonday(day)) continue;
+
+                      String mode = getModeForDate(context, day);
+                      Calendar reminder = (Calendar) day.clone();
+                      reminder.set(Calendar.HOUR_OF_DAY, getReminderHour(mode));
+                      reminder.set(Calendar.MINUTE, getReminderMinute(mode));
+                      reminder.set(Calendar.SECOND, 0);
+                      reminder.set(Calendar.MILLISECOND, 0);
+
+                      if (reminder.getTimeInMillis() > now.getTimeInMillis()) {
+                          return "Your next shift is " + dayName(day) + ", " + getShiftForMode(mode) +
+                                  ". I will remind you at " + getReminderText(mode) + ".";
+                      }
+                  }
+
+                  return "Peter, I could not calculate the next shift. Open the app and activate auto-rotation again.";
+              }
+
+              public static String sleepAdvice(Context context) {
+                  Calendar today = Calendar.getInstance();
+
+                  if (isMonday(today)) {
+                      return "Peter, today is your day off. Rest properly, but do not sleep too late so your body stays ready for the next shift.";
+                  }
+
+                  String mode = getModeForDate(context, today);
+
+                  if (mode.equals(MODE_A)) {
+                      return "Since your shift is 4:00 AM to 12:00 NN and your reminder is 2:40 AM, you should sleep as early as possible. Best target is before 8:00 PM. Prepare your uniform, water, fare, and phone charger before sleeping.";
+                  } else {
+                      return "Since your shift is 11:30 AM to 7:30 PM and your reminder is 10:00 AM, you can sleep normally, but avoid sleeping too late. Best target is before 11:30 PM or midnight.";
+                  }
+              }
+
+              public static String prepareAdvice(Context context) {
+                  Calendar today = Calendar.getInstance();
+
+                  if (isMonday(today)) {
+                      return "Peter, today is Monday and you are off. No work preparation needed. Use today for rest, laundry, budgeting, phone charging, and checking your next schedule.";
+                  }
+
+                  String mode = getModeForDate(context, today);
+                  return "Prepare for work, Peter. Your shift is " + getShiftForMode(mode) +
+                          ". Bring your uniform, phone, charger, water, fare, food or light snack, and any OceanJet work essentials. Leave early and protect your energy.";
+              }
+
+              public static String rotationStatus(Context context) {
+                  Calendar today = Calendar.getInstance();
+                  String todayMode = getModeForDate(context, today);
+
+                  Calendar nextSunday = Calendar.getInstance();
+                  while (nextSunday.get(Calendar.DAY_OF_WEEK) != Calendar.SUNDAY || nextSunday.before(today)) {
+                      nextSunday.add(Calendar.DATE, 1);
+                  }
+
+                  Calendar afterSunday = (Calendar) nextSunday.clone();
+                  afterSunday.add(Calendar.DATE, 1);
+
+                  String sundayMode = getModeForDate(context, nextSunday);
+
+                  return "Current rotation today is " + getModeName(todayMode) +
+                          ". On the coming Sunday, the rotation is " + getModeName(sundayMode) +
+                          ". Monday remains your fixed day off.";
+              }
+
+              public static int scheduleUpcoming(Context context) {
+                  cancelAll(context);
+
+                  Calendar now = Calendar.getInstance();
+                  int count = 0;
+
+                  for (int i = 0; i < 28; i++) {
+                      Calendar day = Calendar.getInstance();
+                      day.add(Calendar.DATE, i);
+
+                      if (!isMonday(day)) {
+                          String mode = getModeForDate(context, day);
+
+                          Calendar reminder = (Calendar) day.clone();
+                          reminder.set(Calendar.HOUR_OF_DAY, getReminderHour(mode));
+                          reminder.set(Calendar.MINUTE, getReminderMinute(mode));
+                          reminder.set(Calendar.SECOND, 0);
+                          reminder.set(Calendar.MILLISECOND, 0);
+
+                          if (reminder.getTimeInMillis() > now.getTimeInMillis()) {
+                              String message = "Peter, wake up. Today is " + dayName(day) +
+                                      ". Your work is " + getShiftForMode(mode) +
+                                      ". Prepare your uniform, phone, charger, water, fare, and food. Reminder time is " +
+                                      getReminderText(mode) + ".";
+
+                              scheduleAlarm(context, reminder.getTimeInMillis(), 2000 + i, "Work Reminder", message);
+                              count++;
+                          }
+                      }
+
+                      if (day.get(Calendar.DAY_OF_WEEK) == Calendar.SUNDAY) {
+                          Calendar reset = (Calendar) day.clone();
+                          reset.set(Calendar.HOUR_OF_DAY, 20);
+                          reset.set(Calendar.MINUTE, 0);
+                          reset.set(Calendar.SECOND, 0);
+                          reset.set(Calendar.MILLISECOND, 0);
+
+                          if (reset.getTimeInMillis() > now.getTimeInMillis()) {
+                              String msg = "Peter, today is Sunday reset day. Your weekly schedule rotation changes every Sunday. Open the app and confirm if your next week schedule is still correct.";
+                              scheduleAlarm(context, reset.getTimeInMillis(), 4000 + i, "Sunday Reset", msg);
+                              count++;
+                          }
+                      }
+                  }
 
                   return count;
               }
 
-              public static void scheduleWorkAlarm(Context context, int day, int hour, int minute, String dayName, String shift, String message) {
-                  long when = nextTimeMillis(day, hour, minute);
-                  int requestCode = 1000 + day;
-                  scheduleAlarm(context, when, requestCode, "WORK", day, hour, minute, dayName, shift, message);
-              }
-
-              public static void scheduleSundayReset(Context context) {
-                  String message =
-                          "Peter, today is schedule reset day. Send your new Monday to Sunday work schedule and reminder times.";
-                  long when = nextTimeMillis(Calendar.SUNDAY, 20, 0);
-                  scheduleAlarm(context, when, 9000, "RESET", Calendar.SUNDAY, 20, 0, "SUN", "RESET", message);
-              }
-
-              public static void scheduleAgainNextWeek(Context context, String type, int day, int hour, int minute, String dayName, String shift, String message) {
-                  int requestCode = type.equals("RESET") ? 9000 : 1000 + day;
-                  long when = nextTimeMillis(day, hour, minute);
-                  scheduleAlarm(context, when, requestCode, type, day, hour, minute, dayName, shift, message);
-              }
-
-              private static void scheduleAlarm(Context context, long when, int requestCode, String type, int day, int hour, int minute, String dayName, String shift, String message) {
+              private static void scheduleAlarm(Context context, long when, int requestCode, String title, String message) {
                   AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+                  if (alarmManager == null) return;
 
                   Intent intent = new Intent(context, AlarmReceiver.class);
-                  intent.putExtra("type", type);
-                  intent.putExtra("day", day);
-                  intent.putExtra("hour", hour);
-                  intent.putExtra("minute", minute);
-                  intent.putExtra("dayName", dayName);
-                  intent.putExtra("shift", shift);
+                  intent.putExtra("title", title);
                   intent.putExtra("message", message);
 
                   PendingIntent pi = PendingIntent.getBroadcast(
@@ -265,20 +418,20 @@ jobs:
                           PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
                   );
 
-                  if (alarmManager != null) {
-                      alarmManager.setAlarmClock(new AlarmManager.AlarmClockInfo(when, showPi), pi);
-                  }
+                  alarmManager.setAlarmClock(new AlarmManager.AlarmClockInfo(when, showPi), pi);
               }
 
               public static void cancelAll(Context context) {
-                  for (int d = Calendar.SUNDAY; d <= Calendar.SATURDAY; d++) {
-                      cancelCode(context, 1000 + d);
+                  AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+                  if (alarmManager == null) return;
+
+                  for (int i = 0; i < 100; i++) {
+                      cancelCode(context, alarmManager, 2000 + i);
+                      cancelCode(context, alarmManager, 4000 + i);
                   }
-                  cancelCode(context, 9000);
               }
 
-              private static void cancelCode(Context context, int requestCode) {
-                  AlarmManager alarmManager = (AlarmManager) context.getSystemService(Context.ALARM_SERVICE);
+              private static void cancelCode(Context context, AlarmManager alarmManager, int requestCode) {
                   Intent intent = new Intent(context, AlarmReceiver.class);
                   PendingIntent pi = PendingIntent.getBroadcast(
                           context,
@@ -286,46 +439,82 @@ jobs:
                           intent,
                           PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE
                   );
-                  if (alarmManager != null) alarmManager.cancel(pi);
+                  alarmManager.cancel(pi);
               }
 
-              private static long nextTimeMillis(int day, int hour, int minute) {
-                  Calendar now = Calendar.getInstance();
-                  Calendar target = Calendar.getInstance();
+              public static long mostRecentSundayStartMillis() {
+                  Calendar c = Calendar.getInstance();
+                  c.set(Calendar.HOUR_OF_DAY, 0);
+                  c.set(Calendar.MINUTE, 0);
+                  c.set(Calendar.SECOND, 0);
+                  c.set(Calendar.MILLISECOND, 0);
 
-                  target.set(Calendar.DAY_OF_WEEK, day);
-                  target.set(Calendar.HOUR_OF_DAY, hour);
-                  target.set(Calendar.MINUTE, minute);
-                  target.set(Calendar.SECOND, 0);
-                  target.set(Calendar.MILLISECOND, 0);
+                  int diff = c.get(Calendar.DAY_OF_WEEK) - Calendar.SUNDAY;
+                  c.add(Calendar.DATE, -diff);
 
-                  if (target.getTimeInMillis() <= now.getTimeInMillis()) {
-                      target.add(Calendar.WEEK_OF_YEAR, 1);
-                  }
-
-                  return target.getTimeInMillis();
+                  return c.getTimeInMillis();
               }
 
-              private static int dayToCalendar(String day) {
-                  if (day.equals("SUN")) return Calendar.SUNDAY;
-                  if (day.equals("MON")) return Calendar.MONDAY;
-                  if (day.equals("TUE")) return Calendar.TUESDAY;
-                  if (day.equals("WED")) return Calendar.WEDNESDAY;
-                  if (day.equals("THU")) return Calendar.THURSDAY;
-                  if (day.equals("FRI")) return Calendar.FRIDAY;
-                  if (day.equals("SAT")) return Calendar.SATURDAY;
-                  return -1;
+              public static long sundayStartMillis(Calendar input) {
+                  Calendar c = (Calendar) input.clone();
+                  c.set(Calendar.HOUR_OF_DAY, 0);
+                  c.set(Calendar.MINUTE, 0);
+                  c.set(Calendar.SECOND, 0);
+                  c.set(Calendar.MILLISECOND, 0);
+
+                  int diff = c.get(Calendar.DAY_OF_WEEK) - Calendar.SUNDAY;
+                  c.add(Calendar.DATE, -diff);
+
+                  return c.getTimeInMillis();
               }
 
-              private static int[] parseTime(String text) {
+              public static String dayName(Calendar c) {
+                  return new SimpleDateFormat("EEEE", Locale.US).format(c.getTime());
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/peteraireminder/PhoneActions.java <<'EOF'
+          package com.peteraireminder;
+
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.widget.Toast;
+
+          public class PhoneActions {
+              public static void copyMessengerCommand(Context context) {
+                  ClipboardManager clipboard = (ClipboardManager) context.getSystemService(Context.CLIPBOARD_SERVICE);
+                  ClipData clip = ClipData.newPlainText("Peter AI Command", "Call mode. Prepare me for work.");
+                  clipboard.setPrimaryClip(clip);
+                  Toast.makeText(context, "Messenger command copied.", Toast.LENGTH_SHORT).show();
+              }
+
+              public static void openMessenger(Context context) {
                   try {
-                      String[] p = text.split(":");
-                      int h = Integer.parseInt(p[0]);
-                      int m = Integer.parseInt(p[1]);
-                      if (h < 0 || h > 23 || m < 0 || m > 59) return null;
-                      return new int[]{h, m};
+                      Intent launchIntent = context.getPackageManager().getLaunchIntentForPackage("com.facebook.orca");
+                      if (launchIntent != null) {
+                          launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          context.startActivity(launchIntent);
+                      } else {
+                          Intent web = new Intent(Intent.ACTION_VIEW, Uri.parse("https://m.me/"));
+                          web.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                          context.startActivity(web);
+                      }
                   } catch (Exception e) {
-                      return null;
+                      Toast.makeText(context, "Open Messenger manually.", Toast.LENGTH_LONG).show();
+                  }
+              }
+
+              public static void openDialer(Context context) {
+                  try {
+                      Intent intent = new Intent(Intent.ACTION_DIAL);
+                      intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                      context.startActivity(intent);
+                  } catch (Exception e) {
+                      Toast.makeText(context, "Open Phone app manually.", Toast.LENGTH_LONG).show();
                   }
               }
           }
@@ -336,141 +525,162 @@ jobs:
 
           import android.Manifest;
           import android.app.Activity;
-          import android.os.Bundle;
-          import android.os.Build;
-          import android.content.Context;
           import android.content.Intent;
-          import android.content.ClipboardManager;
-          import android.content.ClipData;
           import android.content.pm.PackageManager;
+          import android.graphics.Color;
           import android.graphics.Typeface;
-          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
           import android.view.Gravity;
           import android.view.View;
           import android.widget.Button;
-          import android.widget.EditText;
           import android.widget.LinearLayout;
           import android.widget.ScrollView;
           import android.widget.TextView;
           import android.widget.Toast;
 
           public class MainActivity extends Activity {
-              private EditText scheduleBox;
-              private TextView statusText;
+              private TextView status;
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
                   requestNotificationPermission();
+                  ScheduleHelper.initDefaults(this);
 
                   ScrollView scroll = new ScrollView(this);
                   LinearLayout root = new LinearLayout(this);
                   root.setOrientation(LinearLayout.VERTICAL);
-                  root.setPadding(38, 45, 38, 45);
+                  root.setPadding(36, 45, 36, 45);
                   scroll.addView(root);
 
                   TextView title = new TextView(this);
-                  title.setText("Peter AI Reminder v2");
-                  title.setTextSize(28);
+                  title.setText("Peter AI Reminder v3");
+                  title.setTextSize(29);
                   title.setTypeface(null, Typeface.BOLD);
                   title.setGravity(Gravity.CENTER);
+                  title.setTextColor(Color.rgb(20, 30, 45));
                   root.addView(title);
 
-                  TextView info = new TextView(this);
-                  info.setText(
-                          "\nAutomatic local reminder assistant.\n\n" +
-                          "Fixed rule:\n" +
-                          "Monday = Day off. No work alarm.\n\n" +
-                          "Sunday 8:00 PM = schedule reset reminder.\n\n" +
-                          "Edit your weekly schedule below using 24-hour time.\n\n" +
-                          "Format:\n" +
-                          "DAY SHIFT REMINDER\n\n" +
-                          "Example:\n" +
-                          "TUE 04:00-12:00 02:40\n" +
-                          "SUN 11:30-19:30 10:00\n"
-                  );
-                  info.setTextSize(16);
-                  root.addView(info);
+                  TextView sub = new TextView(this);
+                  sub.setText("\nVoice assistant + automatic rotating schedule.\nMonday is always day off.\nSunday is schedule changeover day.\n");
+                  sub.setTextSize(16);
+                  sub.setGravity(Gravity.CENTER);
+                  root.addView(sub);
 
-                  scheduleBox = new EditText(this);
-                  scheduleBox.setText(ScheduleHelper.getSchedule(this));
-                  scheduleBox.setTextSize(16);
-                  scheduleBox.setMinLines(8);
-                  scheduleBox.setGravity(Gravity.TOP);
-                  root.addView(scheduleBox);
+                  status = new TextView(this);
+                  status.setTextSize(17);
+                  status.setText(getDashboardText());
+                  root.addView(status);
 
-                  Button saveButton = new Button(this);
-                  saveButton.setText("Save Schedule and Activate Automatic Alarms");
-                  saveButton.setOnClickListener(new View.OnClickListener() {
+                  Button ask = makeButton("🎤 Ask Peter AI");
+                  ask.setOnClickListener(new View.OnClickListener() {
                       @Override
                       public void onClick(View v) {
-                          String text = scheduleBox.getText().toString().trim();
-                          ScheduleHelper.saveSchedule(MainActivity.this, text);
-                          int count = ScheduleHelper.scheduleAll(MainActivity.this);
-                          statusText.setText("Activated. Scheduled " + count + " automatic reminders. Monday is protected as day off.");
-                          Toast.makeText(MainActivity.this, "Automatic reminders activated.", Toast.LENGTH_LONG).show();
+                          startActivity(new Intent(MainActivity.this, VoiceAssistantActivity.class));
                       }
                   });
-                  root.addView(saveButton);
+                  root.addView(ask);
 
-                  Button resetDefault = new Button(this);
-                  resetDefault.setText("Restore Default Schedule");
-                  resetDefault.setOnClickListener(new View.OnClickListener() {
+                  Button activate = makeButton("Activate Auto-Rotation Alarms");
+                  activate.setOnClickListener(new View.OnClickListener() {
                       @Override
                       public void onClick(View v) {
-                          scheduleBox.setText(ScheduleHelper.DEFAULT_SCHEDULE);
-                          ScheduleHelper.saveSchedule(MainActivity.this, ScheduleHelper.DEFAULT_SCHEDULE);
-                          Toast.makeText(MainActivity.this, "Default schedule restored.", Toast.LENGTH_SHORT).show();
+                          int count = ScheduleHelper.scheduleUpcoming(MainActivity.this);
+                          status.setText(getDashboardText() + "\n\nActivated " + count + " upcoming reminders.");
+                          Toast.makeText(MainActivity.this, "Auto-rotation alarms activated.", Toast.LENGTH_LONG).show();
                       }
                   });
-                  root.addView(resetDefault);
+                  root.addView(activate);
 
-                  Button cancelButton = new Button(this);
-                  cancelButton.setText("Cancel All App Alarms");
-                  cancelButton.setOnClickListener(new View.OnClickListener() {
+                  Button modeA = makeButton("Set Current Week: 4 AM Week");
+                  modeA.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          ScheduleHelper.setCurrentWeekMode(MainActivity.this, ScheduleHelper.MODE_A);
+                          status.setText(getDashboardText());
+                          Toast.makeText(MainActivity.this, "Current week set to 4 AM Week.", Toast.LENGTH_LONG).show();
+                      }
+                  });
+                  root.addView(modeA);
+
+                  Button modeB = makeButton("Set Current Week: 11:30 AM Week");
+                  modeB.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          ScheduleHelper.setCurrentWeekMode(MainActivity.this, ScheduleHelper.MODE_B);
+                          status.setText(getDashboardText());
+                          Toast.makeText(MainActivity.this, "Current week set to 11:30 AM Week.", Toast.LENGTH_LONG).show();
+                      }
+                  });
+                  root.addView(modeB);
+
+                  Button messenger = makeButton("Open Messenger");
+                  messenger.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          PhoneActions.openMessenger(MainActivity.this);
+                      }
+                  });
+                  root.addView(messenger);
+
+                  Button copy = makeButton("Copy Messenger AI Command");
+                  copy.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          PhoneActions.copyMessengerCommand(MainActivity.this);
+                      }
+                  });
+                  root.addView(copy);
+
+                  Button cancel = makeButton("Cancel All App Alarms");
+                  cancel.setOnClickListener(new View.OnClickListener() {
                       @Override
                       public void onClick(View v) {
                           ScheduleHelper.cancelAll(MainActivity.this);
-                          statusText.setText("All Peter AI Reminder alarms cancelled.");
-                          Toast.makeText(MainActivity.this, "Alarms cancelled.", Toast.LENGTH_SHORT).show();
+                          status.setText(getDashboardText() + "\n\nAll app alarms cancelled.");
+                          Toast.makeText(MainActivity.this, "All app alarms cancelled.", Toast.LENGTH_SHORT).show();
                       }
                   });
-                  root.addView(cancelButton);
+                  root.addView(cancel);
 
-                  Button copyCommand = new Button(this);
-                  copyCommand.setText("Copy Messenger AI Command");
-                  copyCommand.setOnClickListener(new View.OnClickListener() {
-                      @Override
-                      public void onClick(View v) {
-                          copyText("Call mode. Prepare me for work.");
-                      }
-                  });
-                  root.addView(copyCommand);
-
-                  Button openMessenger = new Button(this);
-                  openMessenger.setText("Open Messenger");
-                  openMessenger.setOnClickListener(new View.OnClickListener() {
-                      @Override
-                      public void onClick(View v) {
-                          openMessenger();
-                      }
-                  });
-                  root.addView(openMessenger);
-
-                  statusText = new TextView(this);
-                  statusText.setText(
-                          "\nStatus: Ready.\n\n" +
-                          "After installing v2:\n" +
-                          "1. Allow notifications.\n" +
-                          "2. Save and activate automatic alarms.\n" +
-                          "3. Keep Monday as OFF.\n" +
-                          "4. Every Sunday, update your next weekly schedule.\n\n" +
-                          "Local AI style: the app uses smart rules without internet or API cost."
+                  TextView footer = new TextView(this);
+                  footer.setText(
+                          "\nVoice commands to try:\n" +
+                          "- What is my schedule today?\n" +
+                          "- Am I off today?\n" +
+                          "- Prepare me for work.\n" +
+                          "- What time should I sleep?\n" +
+                          "- What is my next shift?\n" +
+                          "- Switch to 4 AM week.\n" +
+                          "- Switch to 11:30 AM week.\n" +
+                          "- Open Messenger.\n" +
+                          "- Copy Messenger command.\n" +
+                          "- Open dialer.\n"
                   );
-                  statusText.setTextSize(16);
-                  root.addView(statusText);
+                  footer.setTextSize(15);
+                  root.addView(footer);
 
                   setContentView(scroll);
+              }
+
+              private Button makeButton(String text) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setTextSize(16);
+                  return b;
+              }
+
+              private String getDashboardText() {
+                  return "\nToday:\n" +
+                          ScheduleHelper.todaySummary(this) +
+                          "\n\nNext shift:\n" +
+                          ScheduleHelper.nextShiftSummary(this) +
+                          "\n\nRotation:\n" +
+                          ScheduleHelper.rotationStatus(this) +
+                          "\n\nReminder rules:\n" +
+                          "4 AM Week = 4:00 AM to 12:00 NN, reminder at 2:40 AM.\n" +
+                          "11:30 AM Week = 11:30 AM to 7:30 PM, reminder at 10:00 AM.\n";
               }
 
               private void requestNotificationPermission() {
@@ -480,25 +690,358 @@ jobs:
                       }
                   }
               }
+          }
+          EOF
 
-              private void copyText(String text) {
-                  ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                  ClipData clip = ClipData.newPlainText("Messenger AI Command", text);
-                  clipboard.setPrimaryClip(clip);
-                  Toast.makeText(this, "Command copied.", Toast.LENGTH_SHORT).show();
+          cat > app/src/main/java/com/peteraireminder/VoiceAssistantActivity.java <<'EOF'
+          package com.peteraireminder;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.speech.RecognitionListener;
+          import android.speech.RecognizerIntent;
+          import android.speech.SpeechRecognizer;
+          import android.speech.tts.TextToSpeech;
+          import android.view.Gravity;
+          import android.view.View;
+          import android.widget.Button;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import java.util.ArrayList;
+          import java.util.Locale;
+
+          public class VoiceAssistantActivity extends Activity {
+              private TextView transcript;
+              private TextView answer;
+              private SpeechRecognizer speechRecognizer;
+              private TextToSpeech tts;
+              private String lastAnswer = "";
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  requestMicPermission();
+
+                  tts = new TextToSpeech(this, new TextToSpeech.OnInitListener() {
+                      @Override
+                      public void onInit(int status) {
+                          if (status == TextToSpeech.SUCCESS) {
+                              tts.setLanguage(Locale.US);
+                          }
+                      }
+                  });
+
+                  ScrollView scroll = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(36, 45, 36, 45);
+                  scroll.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("Ask Peter AI");
+                  title.setTextSize(28);
+                  title.setTypeface(null, Typeface.BOLD);
+                  title.setGravity(Gravity.CENTER);
+                  title.setTextColor(Color.rgb(20, 30, 45));
+                  root.addView(title);
+
+                  TextView guide = new TextView(this);
+                  guide.setText("\nTap the microphone and ask about your schedule, sleep, work preparation, rotation, or Messenger.\n");
+                  guide.setTextSize(16);
+                  guide.setGravity(Gravity.CENTER);
+                  root.addView(guide);
+
+                  transcript = new TextView(this);
+                  transcript.setText("You said: ...");
+                  transcript.setTextSize(17);
+                  root.addView(transcript);
+
+                  answer = new TextView(this);
+                  answer.setText("\nAssistant answer will appear here.");
+                  answer.setTextSize(18);
+                  answer.setTypeface(null, Typeface.BOLD);
+                  root.addView(answer);
+
+                  Button listen = makeButton("🎤 Listen Now");
+                  listen.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          startListening();
+                      }
+                  });
+                  root.addView(listen);
+
+                  Button speakAgain = makeButton("Speak Answer Again");
+                  speakAgain.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          speak(lastAnswer.length() > 0 ? lastAnswer : "There is no answer yet.");
+                      }
+                  });
+                  root.addView(speakAgain);
+
+                  Button today = makeButton("Quick: Today Schedule");
+                  today.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          processCommand("what is my schedule today");
+                      }
+                  });
+                  root.addView(today);
+
+                  Button prepare = makeButton("Quick: Prepare Me");
+                  prepare.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          processCommand("prepare me for work");
+                      }
+                  });
+                  root.addView(prepare);
+
+                  Button sleep = makeButton("Quick: Sleep Advice");
+                  sleep.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          processCommand("what time should I sleep");
+                      }
+                  });
+                  root.addView(sleep);
+
+                  Button back = makeButton("Back to Dashboard");
+                  back.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          finish();
+                      }
+                  });
+                  root.addView(back);
+
+                  setContentView(scroll);
               }
 
-              private void openMessenger() {
-                  try {
-                      Intent launchIntent = getPackageManager().getLaunchIntentForPackage("com.facebook.orca");
-                      if (launchIntent != null) {
-                          startActivity(launchIntent);
-                      } else {
-                          startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://m.me/")));
+              private Button makeButton(String text) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setTextSize(16);
+                  return b;
+              }
+
+              private void startListening() {
+                  if (Build.VERSION.SDK_INT >= 23) {
+                      if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                          requestMicPermission();
+                          Toast.makeText(this, "Allow microphone permission first.", Toast.LENGTH_LONG).show();
+                          return;
                       }
-                  } catch (Exception e) {
-                      Toast.makeText(this, "Open Messenger manually.", Toast.LENGTH_LONG).show();
                   }
+
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      setAnswer("Voice recognition is not available on this phone. You can still use the quick buttons.");
+                      return;
+                  }
+
+                  speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this);
+                  speechRecognizer.setRecognitionListener(new RecognitionListener() {
+                      @Override public void onReadyForSpeech(Bundle params) {
+                          transcript.setText("Listening...");
+                      }
+
+                      @Override public void onBeginningOfSpeech() { }
+
+                      @Override public void onRmsChanged(float rmsdB) { }
+
+                      @Override public void onBufferReceived(byte[] buffer) { }
+
+                      @Override public void onEndOfSpeech() {
+                          transcript.setText("Processing...");
+                      }
+
+                      @Override public void onError(int error) {
+                          setAnswer("I did not hear clearly. Please tap Listen Now and try again.");
+                      }
+
+                      @Override public void onResults(Bundle results) {
+                          ArrayList<String> matches = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+                          if (matches != null && matches.size() > 0) {
+                              String text = matches.get(0);
+                              processCommand(text);
+                          } else {
+                              setAnswer("I did not understand. Please try again.");
+                          }
+                      }
+
+                      @Override public void onPartialResults(Bundle partialResults) { }
+
+                      @Override public void onEvent(int eventType, Bundle params) { }
+                  });
+
+                  Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                  intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+                  intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.US);
+                  intent.putExtra(RecognizerIntent.EXTRA_PROMPT, "Ask Peter AI");
+
+                  speechRecognizer.startListening(intent);
+              }
+
+              private void processCommand(String command) {
+                  transcript.setText("You said: " + command);
+
+                  String q = command.toLowerCase(Locale.US);
+                  String response;
+
+                  if (containsAny(q, "switch to 4", "switch to four", "4 am week", "four am week", "set 4")) {
+                      ScheduleHelper.setCurrentWeekMode(this, ScheduleHelper.MODE_A);
+                      response = "Done, Peter. I set the current week to 4 AM Week. Your shift is 4:00 AM to 12:00 NN, and your reminder is 2:40 AM. Next Sunday will rotate to 11:30 AM Week.";
+                      setAnswer(response);
+                      return;
+                  }
+
+                  if (containsAny(q, "switch to 11", "switch to eleven", "11:30", "1130", "eleven thirty", "set 11")) {
+                      ScheduleHelper.setCurrentWeekMode(this, ScheduleHelper.MODE_B);
+                      response = "Done, Peter. I set the current week to 11:30 AM Week. Your shift is 11:30 AM to 7:30 PM, and your reminder is 10:00 AM. Next Sunday will rotate to 4 AM Week.";
+                      setAnswer(response);
+                      return;
+                  }
+
+                  if (containsAny(q, "activate alarm", "activate auto", "activate rotation", "set alarm", "schedule alarm")) {
+                      int count = ScheduleHelper.scheduleUpcoming(this);
+                      response = "Auto-rotation alarms are active, Peter. I scheduled " + count + " upcoming reminders. Monday stays protected as your day off.";
+                      setAnswer(response);
+                      return;
+                  }
+
+                  if (containsAny(q, "today", "schedule today", "my schedule")) {
+                      response = ScheduleHelper.todaySummary(this);
+                      setAnswer(response);
+                      return;
+                  }
+
+                  if (containsAny(q, "tomorrow")) {
+                      response = ScheduleHelper.tomorrowSummary(this);
+                      setAnswer(response);
+                      return;
+                  }
+
+                  if (containsAny(q, "am i off", "day off", "off today")) {
+                      response = ScheduleHelper.todaySummary(this);
+                      setAnswer(response);
+                      return;
+                  }
+
+                  if (containsAny(q, "next shift", "next work", "next schedule")) {
+                      response = ScheduleHelper.nextShiftSummary(this);
+                      setAnswer(response);
+                      return;
+                  }
+
+                  if (containsAny(q, "sleep", "what time should i sleep", "rest")) {
+                      response = ScheduleHelper.sleepAdvice(this);
+                      setAnswer(response);
+                      return;
+                  }
+
+                  if (containsAny(q, "prepare", "ready for work", "work checklist")) {
+                      response = ScheduleHelper.prepareAdvice(this);
+                      setAnswer(response);
+                      return;
+                  }
+
+                  if (containsAny(q, "rotation", "week mode", "current week")) {
+                      response = ScheduleHelper.rotationStatus(this);
+                      setAnswer(response);
+                      return;
+                  }
+
+                  if (containsAny(q, "open messenger", "messenger")) {
+                      response = "Opening Messenger, Peter. Send your AI command if you want call mode.";
+                      setAnswer(response);
+                      PhoneActions.openMessenger(this);
+                      return;
+                  }
+
+                  if (containsAny(q, "copy command", "copy messenger")) {
+                      response = "I copied your Messenger AI command: Call mode. Prepare me for work.";
+                      setAnswer(response);
+                      PhoneActions.copyMessengerCommand(this);
+                      return;
+                  }
+
+                  if (containsAny(q, "open dialer", "call someone", "call mama", "call")) {
+                      response = "Contact search will be upgraded in v3.1. For now, I will open your phone dialer so you can choose the contact safely.";
+                      setAnswer(response);
+                      PhoneActions.openDialer(this);
+                      return;
+                  }
+
+                  if (containsAny(q, "photo", "photos", "picture", "january")) {
+                      response = "Photo search by date will be added in v3.2. It will search your phone photos using permission and show matching dates or nearby results.";
+                      setAnswer(response);
+                      return;
+                  }
+
+                  response = "Peter, I can help with schedule, day off, sleep advice, work preparation, auto-rotation, Messenger, and basic phone actions. Try saying: What is my schedule today? Prepare me for work. Or switch to 11:30 AM week.";
+                  setAnswer(response);
+              }
+
+              private boolean containsAny(String q, String... words) {
+                  for (String w : words) {
+                      if (q.contains(w)) return true;
+                  }
+                  return false;
+              }
+
+              private void setAnswer(String text) {
+                  lastAnswer = text;
+                  answer.setText("\n" + text);
+                  speak(text);
+              }
+
+              private void speak(String text) {
+                  try {
+                      if (tts != null) {
+                          if (Build.VERSION.SDK_INT >= 21) {
+                              tts.speak(text, TextToSpeech.QUEUE_FLUSH, null, "peter_voice");
+                          } else {
+                              tts.speak(text, TextToSpeech.QUEUE_FLUSH, null);
+                          }
+                      }
+                  } catch (Exception ignored) { }
+              }
+
+              private void requestMicPermission() {
+                  if (Build.VERSION.SDK_INT >= 23) {
+                      if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                          requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 200);
+                      }
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  try {
+                      if (speechRecognizer != null) {
+                          speechRecognizer.destroy();
+                          speechRecognizer = null;
+                      }
+                  } catch (Exception ignored) { }
+
+                  try {
+                      if (tts != null) {
+                          tts.stop();
+                          tts.shutdown();
+                          tts = null;
+                      }
+                  } catch (Exception ignored) { }
+
+                  super.onDestroy();
               }
           }
           EOF
@@ -521,41 +1064,34 @@ jobs:
           import android.os.Vibrator;
 
           public class AlarmReceiver extends BroadcastReceiver {
-              private static final String CHANNEL_ID = "peter_alarm_channel";
+              private static final String CHANNEL_ID = "peter_alarm_channel_v3";
 
               @Override
               public void onReceive(Context context, Intent intent) {
-                  String type = intent.getStringExtra("type");
-                  int day = intent.getIntExtra("day", 1);
-                  int hour = intent.getIntExtra("hour", 8);
-                  int minute = intent.getIntExtra("minute", 0);
-                  String dayName = intent.getStringExtra("dayName");
-                  String shift = intent.getStringExtra("shift");
+                  String title = intent.getStringExtra("title");
                   String message = intent.getStringExtra("message");
 
-                  if (type == null) type = "WORK";
-                  if (dayName == null) dayName = "";
-                  if (shift == null) shift = "";
+                  if (title == null) title = "Peter AI Reminder";
                   if (message == null) message = "Peter, this is your reminder.";
 
                   vibrate(context);
-                  showNotification(context, message);
-                  openAlarmScreen(context, message);
+                  showNotification(context, title, message);
+                  openAlarmScreen(context, title, message);
 
-                  ScheduleHelper.scheduleAgainNextWeek(context, type, day, hour, minute, dayName, shift, message);
+                  ScheduleHelper.scheduleUpcoming(context);
               }
 
-              private void openAlarmScreen(Context context, String message) {
+              private void openAlarmScreen(Context context, String title, String message) {
                   try {
                       Intent i = new Intent(context, AlarmActivity.class);
+                      i.putExtra("title", title);
                       i.putExtra("message", message);
                       i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TOP);
                       context.startActivity(i);
-                  } catch (Exception ignored) {
-                  }
+                  } catch (Exception ignored) { }
               }
 
-              private void showNotification(Context context, String message) {
+              private void showNotification(Context context, String title, String message) {
                   NotificationManager nm = (NotificationManager) context.getSystemService(Context.NOTIFICATION_SERVICE);
                   if (nm == null) return;
 
@@ -569,17 +1105,19 @@ jobs:
 
                       NotificationChannel channel = new NotificationChannel(
                               CHANNEL_ID,
-                              "Peter AI Reminders",
+                              "Peter AI Reminders v3",
                               NotificationManager.IMPORTANCE_HIGH
                       );
-                      channel.setDescription("Work schedule alarms and reminders");
+                      channel.setDescription("Work alarms, Sunday reset reminders, and assistant alerts");
                       channel.enableVibration(true);
                       channel.setSound(sound, attrs);
                       nm.createNotificationChannel(channel);
                   }
 
                   Intent open = new Intent(context, AlarmActivity.class);
+                  open.putExtra("title", title);
                   open.putExtra("message", message);
+
                   PendingIntent openPi = PendingIntent.getActivity(
                           context,
                           777,
@@ -595,7 +1133,7 @@ jobs:
                   }
 
                   builder.setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
-                          .setContentTitle("Peter AI Reminder")
+                          .setContentTitle(title)
                           .setContentText(message)
                           .setStyle(new Notification.BigTextStyle().bigText(message))
                           .setCategory(Notification.CATEGORY_ALARM)
@@ -606,7 +1144,7 @@ jobs:
                           .setSound(sound)
                           .setVibrate(new long[]{0, 700, 400, 700, 400, 1000});
 
-                  nm.notify(1001, builder.build());
+                  nm.notify(3001, builder.build());
               }
 
               private void vibrate(Context context) {
@@ -621,8 +1159,7 @@ jobs:
                       } else {
                           vibrator.vibrate(pattern, -1);
                       }
-                  } catch (Exception ignored) {
-                  }
+                  } catch (Exception ignored) { }
               }
           }
           EOF
@@ -631,16 +1168,14 @@ jobs:
           package com.peteraireminder;
 
           import android.app.Activity;
-          import android.os.Bundle;
-          import android.os.Build;
-          import android.content.Context;
           import android.content.Intent;
-          import android.content.ClipboardManager;
-          import android.content.ClipData;
+          import android.graphics.Color;
           import android.graphics.Typeface;
           import android.media.MediaPlayer;
           import android.media.RingtoneManager;
           import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
           import android.speech.tts.TextToSpeech;
           import android.view.Gravity;
           import android.view.View;
@@ -649,7 +1184,6 @@ jobs:
           import android.widget.LinearLayout;
           import android.widget.ScrollView;
           import android.widget.TextView;
-          import android.widget.Toast;
           import java.util.Locale;
 
           public class AlarmActivity extends Activity {
@@ -671,7 +1205,10 @@ jobs:
                       setTurnScreenOn(true);
                   }
 
+                  String titleText = getIntent().getStringExtra("title");
                   String message = getIntent().getStringExtra("message");
+
+                  if (titleText == null) titleText = "Peter AI Reminder";
                   if (message == null) message = "Peter, this is your reminder.";
 
                   startAlarmSound();
@@ -684,10 +1221,11 @@ jobs:
                   scroll.addView(root);
 
                   TextView title = new TextView(this);
-                  title.setText("Peter, Wake Up");
+                  title.setText(titleText);
                   title.setTextSize(30);
                   title.setTypeface(null, Typeface.BOLD);
                   title.setGravity(Gravity.CENTER);
+                  title.setTextColor(Color.rgb(20, 30, 45));
                   root.addView(title);
 
                   TextView body = new TextView(this);
@@ -695,8 +1233,7 @@ jobs:
                   body.setTextSize(20);
                   root.addView(body);
 
-                  Button stop = new Button(this);
-                  stop.setText("Stop Alarm");
+                  Button stop = makeButton("Stop Alarm");
                   stop.setOnClickListener(new View.OnClickListener() {
                       @Override
                       public void onClick(View v) {
@@ -706,27 +1243,42 @@ jobs:
                   });
                   root.addView(stop);
 
-                  Button copy = new Button(this);
-                  copy.setText("Copy Messenger AI Command");
+                  Button ask = makeButton("Ask Peter AI");
+                  ask.setOnClickListener(new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          stopEverything();
+                          startActivity(new Intent(AlarmActivity.this, VoiceAssistantActivity.class));
+                      }
+                  });
+                  root.addView(ask);
+
+                  Button copy = makeButton("Copy Messenger AI Command");
                   copy.setOnClickListener(new View.OnClickListener() {
                       @Override
                       public void onClick(View v) {
-                          copyText("Call mode. Prepare me for work.");
+                          PhoneActions.copyMessengerCommand(AlarmActivity.this);
                       }
                   });
                   root.addView(copy);
 
-                  Button messenger = new Button(this);
-                  messenger.setText("Open Messenger");
+                  Button messenger = makeButton("Open Messenger");
                   messenger.setOnClickListener(new View.OnClickListener() {
                       @Override
                       public void onClick(View v) {
-                          openMessenger();
+                          PhoneActions.openMessenger(AlarmActivity.this);
                       }
                   });
                   root.addView(messenger);
 
                   setContentView(scroll);
+              }
+
+              private Button makeButton(String text) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setTextSize(17);
+                  return b;
               }
 
               private void startAlarmSound() {
@@ -739,8 +1291,7 @@ jobs:
                           player.setLooping(true);
                           player.start();
                       }
-                  } catch (Exception ignored) {
-                  }
+                  } catch (Exception ignored) { }
               }
 
               private void speak(final String message) {
@@ -758,8 +1309,7 @@ jobs:
                               }
                           }
                       });
-                  } catch (Exception ignored) {
-                  }
+                  } catch (Exception ignored) { }
               }
 
               private void stopEverything() {
@@ -769,8 +1319,7 @@ jobs:
                           player.release();
                           player = null;
                       }
-                  } catch (Exception ignored) {
-                  }
+                  } catch (Exception ignored) { }
 
                   try {
                       if (tts != null) {
@@ -778,28 +1327,7 @@ jobs:
                           tts.shutdown();
                           tts = null;
                       }
-                  } catch (Exception ignored) {
-                  }
-              }
-
-              private void copyText(String text) {
-                  ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                  ClipData clip = ClipData.newPlainText("Messenger AI Command", text);
-                  clipboard.setPrimaryClip(clip);
-                  Toast.makeText(this, "Command copied.", Toast.LENGTH_SHORT).show();
-              }
-
-              private void openMessenger() {
-                  try {
-                      Intent launchIntent = getPackageManager().getLaunchIntentForPackage("com.facebook.orca");
-                      if (launchIntent != null) {
-                          startActivity(launchIntent);
-                      } else {
-                          startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse("https://m.me/")));
-                      }
-                  } catch (Exception e) {
-                      Toast.makeText(this, "Open Messenger manually.", Toast.LENGTH_LONG).show();
-                  }
+                  } catch (Exception ignored) { }
               }
 
               @Override
@@ -821,7 +1349,7 @@ jobs:
               @Override
               public void onReceive(Context context, Intent intent) {
                   if (intent != null && Intent.ACTION_BOOT_COMPLETED.equals(intent.getAction())) {
-                      ScheduleHelper.scheduleAll(context);
+                      ScheduleHelper.scheduleUpcoming(context);
                   }
               }
           }
@@ -833,5 +1361,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Peter-AI-Reminder-v2-APK
+          name: Peter-AI-Reminder-v3-APK
           path: app/build/outputs/apk/debug/*.apk
